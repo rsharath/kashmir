@@ -34,6 +34,10 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+
+	"github.com/cockroachdb/pebble"
 )
 
 const openAIAPIURL = "https://api.openai.com/v1/embeddings"
@@ -44,8 +48,8 @@ const openAIAPIURL = "https://api.openai.com/v1/embeddings"
 type Document struct {
 	ID   string
 	Text string
+	Embedding []float64
 	Metadata map[string]interface{}
-
 }
 
 /*
@@ -66,7 +70,7 @@ type Collection struct {
  * VectorDB represents a database of collections
  */ 
 type VectorDB struct {
-	collections map[string]*Collection
+	db *pebble.DB
 }
 
 /*
@@ -148,15 +152,16 @@ func generateEmbedding(inputText string) ([]float64, error) {
 	var embeddingsListResponse EmbeddingsListResponse
 	err = json.Unmarshal(body, &embeddingsListResponse)
 	if err != nil {
+		fmt.Println("Error unmarshalling JSON:", err)
 		return nil, err
 	}
 
 	// Extract the first embedding from the response (if available).
 	if len(embeddingsListResponse.Data) > 0 {
 		embedding := embeddingsListResponse.Data[0].Embedding
-		//fmt.Printf("Embedding: %v\n", embedding)
 		return embedding, nil
 	} else {
+		fmt.Println("No embeddings found in the response")
 		return nil, errors.New("no embeddings found in the response")
 	}
 }
@@ -164,10 +169,17 @@ func generateEmbedding(inputText string) ([]float64, error) {
 /*
  * This function creates a new VectorDB
  */ 
-func NewVectorDB() *VectorDB {
-	return &VectorDB{
-		collections: make(map[string]*Collection),
+func NewVectorDB(dbPath string) (*VectorDB, error) {
+	// Open a Pebble DB instance.
+	db, err := pebble.Open(dbPath, &pebble.Options{})
+	if err != nil {
+		fmt.Println("Error opening Pebble DB:", err)
+		return nil, err
 	}
+
+	return &VectorDB{
+		db: db,	
+	}, nil
 }
 
 /*
@@ -185,190 +197,195 @@ func NewCollection(name string) *Collection {
  * This function creates a new Collection
  */ 
 func (db *VectorDB) CreateCollection(name string) error {
-	if _, exists := db.collections[name]; exists {
+	// Define the prefix for the keys in the collection.
+	prefix := []byte(name + ":")
+
+	// Define the key range for the iterator.
+	iterOptions := &pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: []byte(strings.TrimRight(name, ":") + ";"), // Next character after ":"
+	}
+
+	// Check if the collection already exists.
+	iter := db.db.NewIter(iterOptions)
+	defer iter.Close()
+	if iter.First() {
 		return errors.New("collection already exists")
 	}
-	db.collections[name] = NewCollection(name)
-	return nil
-}
 
-/*
- * This function adds a document to a collection
- */ 
-func (db *VectorDB) AddDocument(collectionName, docID, text string) error {
-	collection, exists := db.collections[collectionName]
-	if !exists {
-		return errors.New("collection not found")
-	}
-	
-	collection.documents = append(collection.documents, Document{ID: docID, Text: text})
-
-	// Call the generateEmbedding function to get the embedding and error.
-	embedding, err := generateEmbedding(text)
-	if err != nil {
-		// Handle the error (e.g., return the error or print an error message).
-		return err
-	}
-
-	// Append the generated embedding to the collection's vectors.
-	collection.vectors = append(collection.vectors, embedding)
-
+	// No need to create a collection explicitly in Pebble.
+	// Collections are created implicitly when documents are added with the corresponding prefix.
 	return nil
 }
 
 /*
  * This function adds a document to a collection, include metadata
  */ 
-func (db *VectorDB) AddDocumentWithMetadata(collectionName, docID, text string, metadata map[string]interface{}) error {
-	collection, exists := db.collections[collectionName]
-	if !exists {
-		fmt.Println("Collection not found")
-		return errors.New("collection not found")
+func (db *VectorDB) AddDocument(collectionName, docID, text string, metadata map[string]interface{}) error {
+	// Construct the document key using the collection name as a prefix.
+	docKey := []byte(collectionName + ":" + docID)
+
+	// Check if the document already exists.
+	_, closer, err := db.db.Get(docKey)
+	if err == nil {
+		closer.Close()
+		return errors.New("document already exists")
+	} else if err != pebble.ErrNotFound {
+		return fmt.Errorf("error checking document existence: %w", err)
 	}
- 
+
+	// Generate the embedding for the document text.
+	embedding, err := generateEmbedding(text)
+	if err != nil {
+		return fmt.Errorf("error generating embedding: %w", err)
+	}
+
+	// Create the document struct.
 	doc := Document{
 		ID:       docID,
 		Text:     text,
+		Embedding: embedding,
 		Metadata: metadata,
 	}
-	collection.documents = append(collection.documents, doc)
-	
-	// Call the generateEmbedding function to get the embedding and error.
-	embedding, err := generateEmbedding(text)
+	fmt.Println("doc:", doc)
+
+	// Serialize the document to JSON.
+	docBytes, err := json.Marshal(doc)
 	if err != nil {
-		// Handle the error (e.g., return the error or print an error message).
-		fmt.Println("Error generating embedding:", err)
-		return err
+		return fmt.Errorf("error serializing document: %w", err)
 	}
 
-	// Append the generated embedding to the collection's vectors.
-	collection.vectors = append(collection.vectors, embedding)
+	// Write the document to the Pebble DB.
+	err = db.db.Set(docKey, docBytes, pebble.Sync)
+	if err != nil {
+		return fmt.Errorf("error writing document to Pebble DB: %w", err)
+	}
 
 	return nil
 }
+
 
 /*
  * This function adds a list of documents to a collection.
  * Fast concurrent loading of documents using go-routines
  */ 
 func (db *VectorDB) AddDocuments(collectionName string, documents []Document) error {
-	collection, exists := db.collections[collectionName]
-	if !exists {
-		return errors.New("collection not found")
-	}
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(documents))
 
-	// Create a channel to receive the results of the concurrent API calls.
-	results := make(chan []float64, len(documents))
-	errors := make(chan error, len(documents))
-
-	// Define a function to generate embeddings concurrently.
-	generateEmbeddingConcurrent := func(text string, results chan []float64, errors chan error) {
-		embedding, err := generateEmbedding(text)
-		if err != nil {
-			errors <- err
-		} else {
-			results <- embedding
-		}
-	}
-
-	// Launch goroutines to generate embeddings for each document.
 	for _, doc := range documents {
-		go generateEmbeddingConcurrent(doc.Text, results, errors)
+		wg.Add(1)
+		go func(doc Document) {
+			defer wg.Done()
+			err := db.AddDocument(collectionName, doc.ID, doc.Text, doc.Metadata)
+			if err != nil {
+				errChan <- err
+			}
+		}(doc)
 	}
 
-	// Collect the results and errors from the goroutines.
-	for i := 0; i < len(documents); i++ {
-		select {
-		case embedding := <-results:
-			collection.vectors = append(collection.vectors, embedding)
-		case err := <-errors:
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors from the goroutines.
+	for err := range errChan {
+		if err != nil {
 			return err
 		}
 	}
-
-	// Append the documents to the collection.
-	collection.documents = append(collection.documents, documents...)
 
 	return nil
 }
 
 /*
- *	This function queries a collection and returns the ID of the document with the closest embedding
- */
-func (db *VectorDB) Query(collectionName string, queryText string) (string, error) {
-	collection, exists := db.collections[collectionName]
-	if !exists {
-		return "", errors.New("collection not found")
-	}
-
-	queryVec, err := generateEmbedding(queryText)
-	nearestID, err := findNearestNeighbor(queryVec, collection.vectors, collection.documents)
-
-	return nearestID, err
-}
-
-/*
- * This function finds the nearest neighbor of a query vector in a collection of vectors
- */
-func findNearestNeighbor(queryVec Vector, vectors []Vector, documents []Document) (string, error) {
-	if len(vectors) == 0 {
-		return "", errors.New("collection is empty")
-	}
-
-	maxSimilarity := -1.0
-	nearestID := ""
-
-	for i, vec := range vectors {
-		similarity := cosineSimilarity(queryVec, vec)
-		if similarity > maxSimilarity {
-			maxSimilarity = similarity
-			nearestID = documents[i].ID
-		}
-	}
-
-	return nearestID, nil
-}
-
-/*
  * Query with metadata filter
 */
-func (db *VectorDB) QueryWithMetadata(collectionName string, queryText string, metadataFilter map[string]interface{}) (string, error) {
-	collection, exists := db.collections[collectionName]
-	if !exists {
-		return "", errors.New("collection not found")
-	}
+func (db *VectorDB) Query(collectionName string, queryText string, metadataFilter map[string]interface{}) (Document, error) {
+	// Generate the embedding for the query text.
+	var matchingDoc Document
 
 	queryVec, err := generateEmbedding(queryText)
-	nearestID, err := findNearestNeighborWithMetadata(queryVec, collection.vectors, collection.documents, metadataFilter)
-	return nearestID, err
-}
-
-/*
- * find nearest neighbor after filtering by the metadata filter
-*/
-func findNearestNeighborWithMetadata(queryVec Vector, vectors []Vector, documents []Document, metadataFilter map[string]interface{}) (string, error) {
-	if len(vectors) == 0 {
-		return "", errors.New("collection is empty")
+	if err != nil {
+		return matchingDoc, err
 	}
 
+	// Define the prefix for the keys in the collection.
+	prefix := []byte(collectionName + ":")
+
+	// Initialize variables to keep track of the nearest document.
+	//var nearestID string
 	maxSimilarity := -1.0
-	nearestID := ""
 
-	for i, vec := range vectors {
-		// Check if the document's metadata matches the metadata filter
-		if !matchesMetadataFilter(documents[i].Metadata, metadataFilter) {
-			continue
+	// Define the key range for the iterator based on the collection name.
+	lowerBound := prefix
+	upperBound := append(prefix, '\xff')
+
+	// Create an iterator with the specified key range.
+	iter := db.db.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+
+	// Convert metadata filter keys to lowercase.
+	for key, value := range metadataFilter {
+		delete(metadataFilter, key)
+		metadataFilter[strings.ToLower(key)] = value
+	}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		// Deserialize the document.
+		var doc Document
+		err := json.Unmarshal(iter.Value(), &doc)
+		if err != nil {
+			return matchingDoc, err
 		}
 
-		similarity := cosineSimilarity(queryVec, vec)
-		if similarity > maxSimilarity {
-			maxSimilarity = similarity
-			nearestID = documents[i].ID
+		//fmt.Println("doc.Metadata:", doc.Metadata)
+		//fmt.Println("metadataFilter:", metadataFilter)
+		
+		// Check if the document matches the metadata filter.
+		matchesFilter := true
+		for key, value := range metadataFilter {
+			//fmt.Printf("Filter Key: %v, Filter Value: %v, Filter Key Type: %T, Filter Value Type: %T\n", key, value, key, value)
+			//fmt.Printf("Doc Metadata Value: %v, Doc Metadata Value Type: %T\n", doc.Metadata[key], doc.Metadata[key])
+
+			//fmt.Println(key, value, doc.Metadata)
+			// Convert document metadata keys to lowercase.
+			lowercaseKey := strings.ToLower(key)
+
+			//docMetadataValue, ok := doc.Metadata[strings.ToLower(key)]
+			//if !ok || docMetadataValue != value {
+			if doc.Metadata[lowercaseKey] != value {
+				matchesFilter = false
+				break
+			}
+		}
+		//fmt.Println("matchesFilter", matchesFilter)
+
+		// If the document matches the filter, calculate its similarity to the query.
+		if matchesFilter {
+			// Ensure that both vectors have the same non-zero length.
+			
+			if len(queryVec) > 0 && len(queryVec) == len(doc.Embedding) {
+				similarity := cosineSimilarity(queryVec, doc.Embedding)
+				if similarity > maxSimilarity {
+					maxSimilarity = similarity
+					//nearestID = doc.ID
+					matchingDoc = doc
+				}
+			}
 		}
 	}
 
-	return nearestID, nil
+	if err := iter.Error(); err != nil {
+		return matchingDoc, err
+	}
+
+	// Return the ID of the nearest document.
+	return matchingDoc, nil
 }
+
+
 
 /*
  * Helper function to check if a document's metadata matches the metadata filter
@@ -400,41 +417,40 @@ func cosineSimilarity(a, b Vector) float64 {
 }
 
 /*
- *	Remove main() function before packaging
+ *	Remove main() function before packaging, Usage Example
  */
+ 
+// Usage example:
 func main() {
-	db := NewVectorDB()
-	collectionName := "articles"
-
-	// Create a collection
-	fmt.Printf("Creating a collection...[%s]", collectionName)
-	err := db.CreateCollection(collectionName)
+	// Initialize the VectorDB.
+	db, err := pebble.Open("vector-db", &pebble.Options{})
 	if err != nil {
-		fmt.Println("Error creating collection:", err)
+		fmt.Println("Error opening Pebble DB:", err)
 		return
 	}
+	vectorDB := &VectorDB{db: db}
+	defer db.Close()
 
-	// Add documents to the collection
-	err = db.AddDocument(collectionName, "doc1", "nothing burger")
-	if err != nil {
-		fmt.Println("Error adding document - doc1:", err)
-		return
+	// Define documents to be added.
+	documents := []Document{
+		{ID: "doc3", Text: "The Manifold on the Moonrings", Metadata: map[string]interface{}{"source": "Notion"}},
+		{ID: "doc4", Text: "Bettymore Bought Some MoreButter", Metadata: map[string]interface{}{"source": "Notion"}},
 	}
 
-	err = db.AddDocument(collectionName, "doc2", "Another example document.")
+	// Add documents to the VectorDB.
+	err = vectorDB.AddDocuments("MyTestCollection", documents)
 	if err != nil {
-		fmt.Println("Error adding document: doc2", err)
-		return
+		fmt.Println("Error adding documents:", err)
 	}
 
-	// Query the collection
-	queryText := "This is a burger"
-	nearestID, err := db.Query(collectionName, queryText)
+	// Query the VectorDB.
+	//var nearestID string
+	queryString := "Moon"
+	var matchingDoc Document
+	matchingDoc, err = vectorDB.Query("MyTestCollection", queryString, map[string]interface{}{"source": "Notion"})
 	if err != nil {
-		fmt.Println("Error querying the collection:", err)
-		return
+		fmt.Println("Error querying VectorDB:", err)
 	}
 
-	fmt.Printf("\nThe closest document to the query \"%s\" is document with ID \"%s\".\n", queryText, nearestID)
+	fmt.Printf("Nearest document to query %s is ID: %s : %s \n", queryString, matchingDoc.ID, matchingDoc.Text)
 }
-
