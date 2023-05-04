@@ -44,6 +44,8 @@ const openAIAPIURL = "https://api.openai.com/v1/embeddings"
 type Document struct {
 	ID   string
 	Text string
+	Metadata map[string]interface{}
+
 }
 
 /*
@@ -215,6 +217,37 @@ func (db *VectorDB) AddDocument(collectionName, docID, text string) error {
 }
 
 /*
+ * This function adds a document to a collection, include metadata
+ */ 
+func (db *VectorDB) AddDocumentWithMetadata(collectionName, docID, text string, metadata map[string]interface{}) error {
+	collection, exists := db.collections[collectionName]
+	if !exists {
+		fmt.Println("Collection not found")
+		return errors.New("collection not found")
+	}
+ 
+	doc := Document{
+		ID:       docID,
+		Text:     text,
+		Metadata: metadata,
+	}
+	collection.documents = append(collection.documents, doc)
+	
+	// Call the generateEmbedding function to get the embedding and error.
+	embedding, err := generateEmbedding(text)
+	if err != nil {
+		// Handle the error (e.g., return the error or print an error message).
+		fmt.Println("Error generating embedding:", err)
+		return err
+	}
+
+	// Append the generated embedding to the collection's vectors.
+	collection.vectors = append(collection.vectors, embedding)
+
+	return nil
+}
+
+/*
  * This function adds a list of documents to a collection.
  * Fast concurrent loading of documents using go-routines
  */ 
@@ -294,6 +327,59 @@ func findNearestNeighbor(queryVec Vector, vectors []Vector, documents []Document
 	}
 
 	return nearestID, nil
+}
+
+/*
+ * Query with metadata filter
+*/
+func (db *VectorDB) QueryWithMetadata(collectionName string, queryText string, metadataFilter map[string]interface{}) (string, error) {
+	collection, exists := db.collections[collectionName]
+	if !exists {
+		return "", errors.New("collection not found")
+	}
+
+	queryVec, err := generateEmbedding(queryText)
+	nearestID, err := findNearestNeighborWithMetadata(queryVec, collection.vectors, collection.documents, metadataFilter)
+	return nearestID, err
+}
+
+/*
+ * find nearest neighbor after filtering by the metadata filter
+*/
+func findNearestNeighborWithMetadata(queryVec Vector, vectors []Vector, documents []Document, metadataFilter map[string]interface{}) (string, error) {
+	if len(vectors) == 0 {
+		return "", errors.New("collection is empty")
+	}
+
+	maxSimilarity := -1.0
+	nearestID := ""
+
+	for i, vec := range vectors {
+		// Check if the document's metadata matches the metadata filter
+		if !matchesMetadataFilter(documents[i].Metadata, metadataFilter) {
+			continue
+		}
+
+		similarity := cosineSimilarity(queryVec, vec)
+		if similarity > maxSimilarity {
+			maxSimilarity = similarity
+			nearestID = documents[i].ID
+		}
+	}
+
+	return nearestID, nil
+}
+
+/*
+ * Helper function to check if a document's metadata matches the metadata filter
+*/
+func matchesMetadataFilter(metadata map[string]interface{}, metadataFilter map[string]interface{}) bool {
+	for key, filterValue := range metadataFilter {
+		if metadataValue, ok := metadata[key]; !ok || metadataValue != filterValue {
+			return false
+		}
+	}
+	return true
 }
 
 /*
