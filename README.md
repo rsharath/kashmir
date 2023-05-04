@@ -31,11 +31,11 @@ Supports the following APIs:
 #### 5. Query a Collection for a Document 
 ```
   // You can query a Collection to find the "closest matching" document to the input "phrase"
-	nearestID, err := db.Query(collectionName, phrase)
+  nearestID, err := db.Query(collectionName, phrase)
 ```
 
 #### 6. Query a Collection for a Document, while filtering by Metadata
 ```
   // You can query a Collection to find the "closest matching" document to the input "phrase". Only look for documents that match the provided "Metadata"
-	nearestID, err := db.Query(collectionName, phrase, metadata)
+  nearestID, err := db.Query(collectionName, phrase, metadata)
 ```
